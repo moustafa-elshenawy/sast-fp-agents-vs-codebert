@@ -23,6 +23,8 @@ Output: one CSV row per case. Columns:
   alert_text      compact summary: one line per (tool, rule, message) group
   code_masked     the whole Java file, license header removed, test names masked
   code_window     the lines around the flagged lines (with context), masked
+  flag_lines      flagged line numbers (original file numbering), space-separated
+  header_offset   leading lines removed from code_masked (flag p -> line p - header_offset)
   n_code_lines, n_window_lines
   n_other_file_refs   CodeQL flow steps that point at a different file
   flagged_blank_lines, flagged_lines_total   alignment sanity check
@@ -335,6 +337,10 @@ def main():
                 ("flagged_blank_lines", flagged_blank),
                 ("flagged_lines_total", flagged_total),
                 ("alert_truncated", truncated), ("has_code", has_code),
+                # flagged lines (1-based, original numbering) and how many leading
+                # lines strip_header removed: line p in code_masked = p - header_offset
+                ("flag_lines", " ".join(str(p) for p in sorted(focus) if 1 <= p <= len(code))),
+                ("header_offset", len(masked) - len(body)),
             ]))
             if shown[pool] < args.show:
                 shown[pool] += 1
