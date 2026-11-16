@@ -47,10 +47,6 @@ ap.add_argument("--timing", action="store_true", help="tiny run + estimate for t
 ap.add_argument("--force", action="store_true", help="re-run even if predictions exist")
 a = ap.parse_args()
 
-MAXLEN = 512
-BUDGET = {"both": (120, 370), "alert": (500, 0), "code": (0, 500)}[a.inputs]
-A_BUD = a.alert_budget if a.alert_budget is not None else BUDGET[0]
-C_BUD = a.code_budget if a.code_budget is not None else BUDGET[1]
 
 random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
 dev = torch.device("cuda" if torch.cuda.is_available() else
@@ -81,103 +77,24 @@ pred_path = os.path.join(a.out, f"preds_{run_name}.csv")
 if os.path.exists(pred_path) and not a.timing and not a.force:
     raise SystemExit(f"{pred_path} exists; use --force to redo it.")
 print(f"run {run_name}: train {len(tr_idx)}, test {len(te_idx)}, device {dev}, "
-      f"budgets alert {A_BUD} / code {C_BUD}")
+      f"inputs {a.inputs}")
 
 tok = AutoTokenizer.from_pretrained(a.model)
 
-# ---------------- input building ----------------
-def ntok(lines):
-    if not lines:
-        return []
-    return [len(x) for x in tok(lines, add_special_tokens=False)["input_ids"]]
-
-def build_alert(row, budget):
-    head = "tools: %s; findings: %s" % (row["tools"].replace(";", ", "), row["n_findings"])
-    out, used, dropped = [head], ntok([head])[0] + 1, 0
-    raw = [l for l in row["alert_text"].split("\n") if l.strip()]
-    short = []
-    for l in raw:
-        parts = l.split(" | ")
-        if len(parts) >= 3:
-            parts[2] = " ".join(parts[2].split()[:10])
-        short.append(" | ".join(parts))
-    for l, n in zip(short, ntok(short)):
-        if used + n + 1 > budget:
-            dropped += 1
-            continue
-        out.append(l); used += n + 1
-    return "\n".join(out), dropped, len(raw)
-
-def build_code(row, budget):
-    lines = row["code_masked"].split("\n")
-    off = int(row["header_offset"])
-    flags = sorted({int(p) - off - 1 for p in row["flag_lines"].split() if p.strip()
-                    if 1 <= int(p) - off <= len(lines)})      # 0-based
-    cost = [n + 1 for n in ntok(lines)]
-    sel, used = set(), 0
-    kept_flags = 0
-    for f in flags:                                            # flagged lines first
-        if used + cost[f] <= budget:
-            sel.add(f); used += cost[f]; kept_flags += 1
-    if not flags:                                              # fallback: file start
-        for i in range(len(lines)):
-            if used + cost[i] > budget:
-                break
-            sel.add(i); used += cost[i]
-    for d in range(1, len(lines)):                             # then widening context
-        added = False
-        for f in flags:
-            for i in (f - d, f + d):
-                if 0 <= i < len(lines) and i not in sel and used + cost[i] <= budget:
-                    sel.add(i); used += cost[i]; added = True
-        if not added and d > 40:
-            break
-    out, prev = [], None
-    for i in sorted(sel):
-        if prev is not None and i != prev + 1:
-            out.append("    // ...")
-        out.append(lines[i]); prev = i
-    return "\n".join(out), len(flags), kept_flags
-
-def encode(row):
-    st = {}
-    atext = ctext = None
-    if A_BUD > 0:
-        atext, st["alert_lines_dropped"], st["alert_lines"] = build_alert(row, A_BUD)
-    if C_BUD > 0:
-        ctext, st["flags"], st["flags_kept"] = build_code(row, C_BUD)
-    if atext is not None and ctext is not None:
-        enc = tok(atext, ctext, truncation="only_second", max_length=MAXLEN)
-        full = tok(atext, ctext, truncation=False)["input_ids"]
-    else:
-        t = atext if atext is not None else ctext
-        enc = tok(t, truncation=True, max_length=MAXLEN)
-        full = tok(t, truncation=False)["input_ids"]
-    st["final_cut"] = int(len(full) > MAXLEN)
-    st["n_tokens"] = len(enc["input_ids"])
-    return enc["input_ids"], st
-
+# ---------------- input building (shared with the embedding script) ----------------
+from cb_inputs import encode_all, report
 t0 = time.time()
-enc_all, stats = [], []
-for _, r in df.iterrows():
-    ids, st = encode(r); enc_all.append(ids); stats.append(st)
-st = pd.DataFrame(stats); st["label"] = df["label"].values
+enc_all, st = encode_all(df, tok, a.inputs, a.alert_budget, a.code_budget)
 print("input building: %.0fs" % (time.time() - t0))
-rep = {"mean_tokens": float(st["n_tokens"].mean()),
-       "share_cut_at_512": st.groupby("label")["final_cut"].mean().round(4).to_dict()}
-if "flags" in st:
-    lost = (st["flags"] - st["flags_kept"]) > 0
-    rep["share_cases_losing_flagged_lines"] = lost.groupby(st["label"]).mean().round(4).to_dict()
-if "alert_lines_dropped" in st:
-    rep["share_cases_with_alert_lines_dropped"] = (st["alert_lines_dropped"] > 0).groupby(st["label"]).mean().round(4).to_dict()
+rep = report(st, df["label"].values)
 print("input stats:", json.dumps(rep))
 
 # ---------------- model ----------------
 full_tr, full_te = len(tr_idx), len(te_idx)
 if a.timing:
     rs = np.random.RandomState(0)
-    tr_idx = rs.choice(tr_idx, min(48, len(tr_idx)), replace=False)
-    te_idx = rs.choice(te_idx, min(16, len(te_idx)), replace=False)
+    tr_idx = rs.choice(tr_idx, min(64, len(tr_idx)), replace=False)
+    te_idx = rs.choice(te_idx, min(48, len(te_idx)), replace=False)
     a.epochs = 1
 
 def batches(idx, bs, shuffle):
@@ -203,6 +120,8 @@ model.train()
 for ep in range(a.epochs):
     run_loss, n_b = 0.0, 0
     for bi, (chunk, ids, att, yb) in enumerate(batches(tr_idx, a.batch, True)):
+        if a.timing and bi == 2:                     # first batches include one-off start-up cost
+            t_train = time.time(); seen = 0
         out = model(input_ids=ids, attention_mask=att, labels=yb)
         (out.loss / a.accum).backward()
         run_loss += out.loss.item(); n_b += 1; seen += len(chunk)
@@ -216,12 +135,16 @@ for ep in range(a.epochs):
     print(f"epoch {ep+1} done, mean loss {run_loss/max(1,n_b):.3f}, {time.time()-t_train:.0f}s", flush=True)
 train_secs = time.time() - t_train
 
-model.eval(); scores = np.zeros(len(df)); t_inf = time.time()
+model.eval(); scores = np.zeros(len(df))
+n_inf = 0; inf_secs = 0.0
 with torch.no_grad():
-    for chunk, ids, att, yb in batches(te_idx, 16, False):
+    for bi, (chunk, ids, att, yb) in enumerate(batches(te_idx, 16, False)):
+        t1 = time.time()
         p = torch.softmax(model(input_ids=ids, attention_mask=att).logits, -1)[:, 1]
         scores[chunk] = p.cpu().numpy()
-inf_secs = time.time() - t_inf
+        if not (a.timing and bi == 0):               # skip warm-up batch when timing
+            inf_secs += time.time() - t1; n_inf += len(chunk)
+n_inf = max(n_inf, 1)
 
 yt, st_ = y_all[te_idx], scores[te_idx]
 def passthrough(y, s, keep):
@@ -235,8 +158,8 @@ else:
 
 if a.timing:
     per_tr = train_secs / seen
-    est = per_tr * full_tr * 3 + (inf_secs / len(te_idx)) * full_te
-    print("\nTIMING: %.2f s per training example, %.2f s per test example" % (per_tr, inf_secs / len(te_idx)))
+    est = per_tr * full_tr * 3 + (inf_secs / n_inf) * full_te
+    print("\nTIMING: %.2f s per training example, %.2f s per test example" % (per_tr, inf_secs / n_inf))
     print("ESTIMATE for this split with 3 epochs: about %.0f minutes (train %d, test %d)" % (est / 60, full_tr, full_te))
     print("(timing run only; nothing saved)")
 else:
